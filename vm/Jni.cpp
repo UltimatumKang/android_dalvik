@@ -495,6 +495,27 @@ static jobject addGlobalReference(Object* obj) {
         dvmGetCurrentJNIMethod()->clazz->descriptor,
         dvmGetCurrentJNIMethod()->name);
 
+    /* GREF usage tracking; should probably be disabled for production env */
+    if (kTrackGrefUsage && gDvm.jniGrefLimit != 0) {
+        int count = gDvm.jniGlobalRefTable.capacity();
+        // TODO: adjust for "holes"
+        if (count > gDvm.jniGlobalRefHiMark) {
+            ALOGD("GREF has increased to %d", count);
+            gDvm.jniGlobalRefHiMark += kGrefWaterInterval;
+            gDvm.jniGlobalRefLoMark += kGrefWaterInterval;
+
+            /* watch for "excessive" use; not generally appropriate */
+            if (count >= gDvm.jniGrefLimit) {
+                if (gDvmJni.warnOnly) {
+                    ALOGW("Excessive JNI global references (%d)", count);
+                } else {
+                    gDvm.jniGlobalRefTable.dump("JNI global");
+                    ALOGE("Excessive JNI global references (%d)", count);
+                    ReportJniError();
+                }
+            }
+        }
+    }
     return jobj;
 }
 
