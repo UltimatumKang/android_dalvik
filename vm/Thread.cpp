@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define ATRACE_TAG ATRACE_TAG_DALVIK
+
 /*
  * Thread support.
  */
@@ -27,12 +29,9 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <signal.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-
-#ifdef HAVE_ANDROID_OS
-#include <dirent.h>
-#endif
 
 #if defined(HAVE_PRCTL)
 #include <sys/prctl.h>
@@ -42,6 +41,7 @@
 #include "interp/Jit.h"         // need for self verification
 #endif
 
+ #include <cutils/trace.h>
 
 /* desktop Linux needs a little help with gettid() */
 #if defined(HAVE_GETTID) && !defined(HAVE_ANDROID_OS)
@@ -1312,10 +1312,10 @@ bool dvmCreateInterpThread(Object* threadObj, int reqStackSize)
          * resource limits.  VirtualMachineError is probably too severe,
          * so use OutOfMemoryError.
          */
-        ALOGE("pthread_create (stack size %d bytes) failed: %s", stackSize, strerror(cc));
 
         dvmSetFieldObject(threadObj, gDvm.offJavaLangThread_vmThread, NULL);
 
+        ALOGE("pthread_create (stack size %d bytes) failed: %s", stackSize, strerror(cc));
         dvmThrowExceptionFmt(gDvm.exOutOfMemoryError,
                              "pthread_create (stack size %d bytes) failed: %s",
                              stackSize, strerror(cc));
@@ -2858,6 +2858,7 @@ static bool fullSuspendCheck(Thread* self)
         ThreadStatus oldStatus = self->status;      /* should be RUNNING */
         self->status = THREAD_SUSPENDED;
 
+        ATRACE_BEGIN("DVM Suspend");
         while (self->suspendCount != 0) {
             /*
              * Wait for wakeup signal, releasing lock.  The act of releasing
@@ -2867,6 +2868,7 @@ static bool fullSuspendCheck(Thread* self)
             dvmWaitCond(&gDvm.threadSuspendCountCond,
                     &gDvm.threadSuspendCountLock);
         }
+        ATRACE_END();
         assert(self->suspendCount == 0 && self->dbgSuspendCount == 0);
         self->status = oldStatus;
         LOG_THREAD("threadid=%d: self-reviving, status=%d",
@@ -3273,6 +3275,36 @@ static void getSchedulerStats(SchedulerStats* stats, pid_t tid) {
     }
 }
 
+static bool shouldShowNativeStack(Thread* thread) {
+    // In native code somewhere in the VM? That's interesting.
+    if (thread->status == THREAD_VMWAIT) {
+        return true;
+    }
+
+    // In an Object.wait variant? That's not interesting.
+    if (thread->status == THREAD_TIMED_WAIT || thread->status == THREAD_WAIT) {
+        return false;
+    }
+
+    // The Signal Catcher thread? That's not interesting.
+    if (thread->status == THREAD_RUNNING) {
+        return false;
+    }
+
+    // In some other native method? That's interesting.
+    // We don't just check THREAD_NATIVE because native methods will be in
+    // state THREAD_SUSPENDED if they're calling back into the VM, or THREAD_MONITOR
+    // if they're blocked on a monitor, or one of the thread-startup states if
+    // it's early enough in their life cycle (http://b/7432159).
+    u4* fp = thread->interpSave.curFrame;
+    if (fp == NULL) {
+        // The thread has no managed frames, so native frames are all there is.
+        return true;
+    }
+    const Method* currentMethod = SAVEAREA_FROM_FP(fp)->method;
+    return currentMethod != NULL && dvmIsNativeMethod(currentMethod);
+}
+
 /*
  * Print information about the specified thread.
  *
@@ -3351,16 +3383,7 @@ void dvmDumpThreadEx(const DebugOutputTarget* target, Thread* thread,
 
     dumpSchedStat(target, thread->systemTid);
 
-    /*
-     * Grab the native stack, if possible.
-     *
-     * The native thread is still running, even if the Dalvik side is
-     * suspended.  This means the thread can move itself out of NATIVE state
-     * while we're in here, shifting to SUSPENDED after a brief moment at
-     * RUNNING.  At that point the native stack isn't all that interesting,
-     * though, so if we fail to dump it there's little lost.
-     */
-    if (thread->status == THREAD_NATIVE || thread->status == THREAD_VMWAIT) {
+    if (shouldShowNativeStack(thread)) {
         dvmDumpNativeStack(target, thread->systemTid);
     }
 
@@ -3491,17 +3514,13 @@ void dvmDumpAllThreadsEx(const DebugOutputTarget* target, bool grabLock)
     }
 
 #ifdef HAVE_ANDROID_OS
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/task", getpid());
-
-    DIR* d = opendir(path);
-    if (d) {
-        dirent de;
-        dirent* result;
+    DIR* d = opendir("/proc/self/task");
+    if (d != NULL) {
+        dirent* entry = NULL;
         bool first = true;
-        while (!readdir_r(d, &de, &result) && result) {
+        while ((entry = readdir(d)) != NULL) {
             char* end;
-            pid_t tid = strtol(de.d_name, &end, 10);
+            pid_t tid = strtol(entry->d_name, &end, 10);
             if (!*end && !isDalvikThread(tid)) {
                 if (first) {
                     dvmPrintDebugMessage(target, "NATIVE THREADS:\n");
